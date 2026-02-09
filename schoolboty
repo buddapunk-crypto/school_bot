@@ -9,8 +9,7 @@ from aiogram.filters import BaseFilter
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, KeyboardButton, InlineKeyboardBuilder, InlineKeyboardButton
 from typing import Any
 import sqlite3
-import schedule
-import time
+import asyncio
 from datetime import datetime
 
 # Настройки бота
@@ -20,7 +19,7 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=storage)
 
 # Подключение к базе данных
-conn = sqlite3.connect('homework.db')
+conn = sqlite3.connect('homework.db', check_same_thread=False)
 cursor = conn.cursor()
 
 # Создание таблицы для хранения заданий
@@ -176,24 +175,21 @@ async def delete_task_callback(callback: CallbackQuery):
     conn.commit()
     await callback.message.edit_text("Задача удалена.")
 
-# 🕓 Напоминания о дедлайнах
-def check_deadlines():
-    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    cursor.execute("SELECT * FROM homework WHERE deadline > ? ORDER BY deadline ASC LIMIT 1", (current_time,))
-    rows = cursor.fetchall()
-    for row in rows:
-        bot.send_message(row[1], f"У вас скоро крайний срок сдачи задания '{row[2]}', срок: {row[3]}")
-
-# Проверяем каждые полчаса
-schedule.every(30).minutes.do(check_deadlines)
+# Функция для отправки уведомлений о дедлайнах
+async def send_deadline_reminders():
+    while True:
+        now = datetime.now()
+        next_check_time = now.replace(minute=now.minute // 30 * 30, second=0, microsecond=0) + timedelta(minutes=30)
+        await asyncio.sleep((next_check_time - now).total_seconds())  # ждем следующего полувасного интервала
+        cursor.execute("SELECT * FROM homework WHERE DATETIME(deadline) >= DATETIME('now') AND DATETIME(deadline) <= DATETIME('now', '+3 hours')")
+        upcoming_rows = cursor.fetchall()
+        for row in upcoming_rows:
+            await bot.send_message(row[1], f"У вас скоро крайний срок сдачи задания '{row[2]}', срок: {row[3]}")
 
 # Основной цикл
+async def main():
+    await dp.start_polling(bot)
+    await send_deadline_reminders()
+
 if __name__ == "__main__":
-    while True:
-        try:
-            dp.run_polling(bot)
-        except Exception as e:
-            print(e)
-        finally:
-            schedule.run_pending()
-        time.sleep(1)
+    asyncio.run(main())
