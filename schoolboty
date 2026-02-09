@@ -1,10 +1,106 @@
-import asyncio
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message
+from aiogram.filters.command import Command
+from aiogram.filters.callback_data import CallbackData
+from aiogram.filters import BaseFilter
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, KeyboardButton, InlineKeyboardBuilder, InlineKeyboardButton
+from typing import Any
 
-bot = Bot(token = "8343120896:AAEBFxXWTtHBr7cVe6e6fSLAADkjlibCF9A")
-dp = Dispatcher()
+import sqlite3
 
-@dp.messange()
-async def echo(message):
-    await message.answer(message.txt)
-asyncio.run(dp.start_polling(bot))
+# Настройки бота
+API_TOKEN = '8343120896:AAEBFxXWTtHBr7cVe6e6fSLAADkjlibCF9A'
+storage = MemoryStorage()
+bot = Bot(API_TOKEN)
+dp = Dispatcher(storage=storage)
+
+# Подключение к базе данных
+conn = sqlite3.connect('homework.db')
+cursor = conn.cursor()
+
+# Создание таблицы для хранения заданий
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS homework (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        subject TEXT,
+        task TEXT,
+        deadline TEXT
+    );
+''')
+conn.commit()
+
+# Группы состояний
+class AddTask(StatesGroup):
+    subject = State()
+    task = State()
+    deadline = State()
+
+# Начало разговора
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer("Привет! Я твой помощник по учебе. Используй /help для списка команд.")
+
+# Команда справки
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(
+        "Доступные команды:\n"
+        "/add_task - добавить новое задание\n"
+        "/view_tasks - посмотреть список текущих заданий\n"
+        "/delete_task - удалить задание"
+    )
+
+# Начнём добавлять задание
+@dp.message(Command("add_task"))
+async def cmd_add_task(message: Message, state: FSMContext):
+    await state.set_state(AddTask.subject)
+    await message.answer("Введите название предмета:")
+
+# Получаем предмет
+@dp.message(F.text, AddTask.subject)
+async def process_subject(message: Message, state: FSMContext):
+    await state.update_data(subject=message.text)
+    await state.set_state(AddTask.task)
+    await message.answer("Опишите задание:")
+
+# Получаем описание задания
+@dp.message(F.text, AddTask.task)
+async def process_task(message: Message, state: FSMContext):
+    await state.update_data(task=message.text)
+    await state.set_state(AddTask.deadline)
+    await message.answer("Введите срок сдачи (ДД.ММ.ГГГГ):")
+
+# Получаем срок сдачи
+@dp.message(F.text, AddTask.deadline)
+async def process_deadline(message: Message, state: FSMContext):
+    data = await state.get_data()
+    subject = data["subject"]
+    task = data["task"]
+    deadline = message.text
+
+    cursor.execute(
+        "INSERT INTO homework VALUES (NULL, ?, ?, ?, ?)",
+        (message.from_user.id, subject, task, deadline)
+    )
+    conn.commit()
+    await state.clear()
+    await message.answer(f"Задание '{subject}' успешно добавлено!")
+
+# Просмотр заданий
+@dp.message(Command("view_tasks"))
+async def cmd_view_tasks(message: Message):
+    cursor.execute("SELECT * FROM homework WHERE user_id=?", (message.from_user.id,))
+    rows = cursor.fetchall()
+    if not rows:
+        await message.answer("У вас нет активных заданий.")
+    else:
+        tasks_list = "\n".join([f"{row[1]} - {row[2]}, Срок: {row[3]}" for row in rows])
+        await message.answer(f"Ваши текущие задания:\n{tasks_list}")
+
+# Основной цикл
+if __name__ == "__main__":
+    dp.run_polling(bot)
