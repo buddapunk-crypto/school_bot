@@ -14,7 +14,7 @@ import time
 from datetime import datetime
 
 # Настройки бота
-API_TOKEN = '8343120896:AAEBFxXWTtHBr7cVe6e6fSLAADkjlibCF9A'  # замените YOUR_API_TOKEN_HERE вашим токеном
+API_TOKEN = 'YOUR_API_TOKEN_HERE'  # замените YOUR_API_TOKEN_HERE вашим токеном
 storage = MemoryStorage()
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=storage)
