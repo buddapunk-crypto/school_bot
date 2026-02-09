@@ -2,19 +2,21 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
 from aiogram.filters.command import Command
 from aiogram.filters.callback_data import CallbackData
 from aiogram.filters import BaseFilter
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, KeyboardButton, InlineKeyboardBuilder, InlineKeyboardButton
 from typing import Any
-
 import sqlite3
+import schedule
+import time
+from datetime import datetime
 
 # Настройки бота
-API_TOKEN = '8343120896:AAEBFxXWTtHBr7cVe6e6fSLAADkjlibCF9A'
+API_TOKEN = '8343120896:AAEBFxXWTtHBr7cVe6e6fSLAADkjlibCF9A'  # замените YOUR_API_TOKEN_HERE вашим токеном
 storage = MemoryStorage()
-bot = Bot(API_TOKEN)
+bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=storage)
 
 # Подключение к базе данных
@@ -39,6 +41,10 @@ class AddTask(StatesGroup):
     task = State()
     deadline = State()
 
+class EditTask(StatesGroup):
+    select_field = State()  # Выбор поля для редактирования
+    new_value = State()     # Новый введенный пользователем значение
+
 # Начало разговора
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -51,10 +57,11 @@ async def cmd_help(message: Message):
         "Доступные команды:\n"
         "/add_task - добавить новое задание\n"
         "/view_tasks - посмотреть список текущих заданий\n"
+        "/edit_task - редактировать задание\n"
         "/delete_task - удалить задание"
     )
 
-# Начнём добавлять задание
+# Начнем добавлять задание
 @dp.message(Command("add_task"))
 async def cmd_add_task(message: Message, state: FSMContext):
     await state.set_state(AddTask.subject)
@@ -101,6 +108,92 @@ async def cmd_view_tasks(message: Message):
         tasks_list = "\n".join([f"{row[1]} - {row[2]}, Срок: {row[3]}" for row in rows])
         await message.answer(f"Ваши текущие задания:\n{tasks_list}")
 
+# ✏️ Редактирование задания
+@dp.message(Command("edit_task"))
+async def cmd_edit_task(message: Message, state: FSMContext):
+    await state.set_state(EditTask.select_field)
+    keyboard = [
+        ["Название предмета"],
+        ["Описание задания"],
+        ["Срок сдачи"],
+        ["Отмена"]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    await message.answer("Выберите поле для редактирования:", reply_markup=reply_markup)
+
+@dp.message(EditTask.select_field)
+async def process_select_field(message: Message, state: FSMContext):
+    field = message.text.lower().strip()
+    fields_map = {
+        "название предмета": "subject",
+        "описание задания": "task",
+        "срок сдачи": "deadline"
+    }
+    selected_field = fields_map.get(field)
+    if selected_field is None or field == "отмена":
+        await state.clear()
+        return await message.answer("Изменение отменено.", reply_markup=None)
+    
+    await state.update_data(selected_field=selected_field)
+    await state.set_state(EditTask.new_value)
+    await message.answer(f"Введите новое значение для поля '{field}':", reply_markup=None)
+
+@dp.message(EditTask.new_value)
+async def process_new_value(message: Message, state: FSMContext):
+    new_value = message.text.strip()
+    data = await state.get_data()
+    selected_field = data['selected_field']
+    
+    cursor.execute(f"UPDATE homework SET {selected_field}=? WHERE user_id=? AND id=(SELECT MAX(id) FROM homework WHERE user_id=?)", (new_value, message.from_user.id, message.from_user.id))
+    conn.commit()
+    await state.clear()
+    await message.answer(f"Поле '{data['selected_field']}' успешно обновлено на '{new_value}'.")
+
+# ❌ Удаление задания
+@dp.message(Command("delete_task"))
+async def cmd_delete_task(message: Message):
+    cursor.execute("SELECT * FROM homework WHERE user_id=?", (message.from_user.id,))
+    rows = cursor.fetchall()
+    if not rows:
+        await message.answer("У вас нет активных заданий.")
+    else:
+        buttons = []
+        for i, row in enumerate(rows):
+            button_text = f"{i+1}. {row[2]} ({row[3]})"
+            buttons.append(button_text)
+        
+        inline_kb = InlineKeyboardBuilder()
+        for btn in buttons:
+            inline_kb.add(InlineKeyboardButton(text=btn, callback_data=f"del_{rows[int(btn.split('.')[0])-1][0]}"))
+        inline_kb.adjust(2)
+        
+        await message.answer("Выберите задание для удаления:", reply_markup=inline_kb.as_markup())
+
+@dp.callback_query(Text(startswith="del_"))
+async def delete_task_callback(callback: CallbackQuery):
+    task_id = int(callback.data.split('_')[1])
+    cursor.execute("DELETE FROM homework WHERE id=?", (task_id,))
+    conn.commit()
+    await callback.message.edit_text("Задача удалена.")
+
+# 🕓 Напоминания о дедлайнах
+def check_deadlines():
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    cursor.execute("SELECT * FROM homework WHERE deadline > ? ORDER BY deadline ASC LIMIT 1", (current_time,))
+    rows = cursor.fetchall()
+    for row in rows:
+        bot.send_message(row[1], f"У вас скоро крайний срок сдачи задания '{row[2]}', срок: {row[3]}")
+
+# Проверяем каждые полчаса
+schedule.every(30).minutes.do(check_deadlines)
+
 # Основной цикл
 if __name__ == "__main__":
-    dp.run_polling(bot)
+    while True:
+        try:
+            dp.run_polling(bot)
+        except Exception as e:
+            print(e)
+        finally:
+            schedule.run_pending()
+        time.sleep(1)
