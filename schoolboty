@@ -2,18 +2,17 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup
 from aiogram.filters.command import Command
-from aiogram.filters.callback_data import CallbackData
 from aiogram.filters import BaseFilter
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, KeyboardButton, InlineKeyboardBuilder, InlineKeyboardButton
 from typing import Any
 import sqlite3
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta  # Добавлен timedelta
 
 # Настройки бота
-API_TOKEN = '8343120896:AAEBFxXWTtHBr7cVe6e6fSLAADkjlibCF9A'  # замените YOUR_API_TOKEN_HERE вашим токеном
+API_TOKEN = '8343120896:AAEBFxXWTtHBr7cVe6e6fSLAADkjlibCF9A'  # замените на ваш токен
 storage = MemoryStorage()
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=storage)
@@ -83,14 +82,21 @@ async def process_task(message: Message, state: FSMContext):
 # Получаем срок сдачи
 @dp.message(F.text, AddTask.deadline)
 async def process_deadline(message: Message, state: FSMContext):
+    try:
+        # Проверяем формат даты
+        deadline_date = datetime.strptime(message.text, "%d.%m.%Y")
+        deadline_str = deadline_date.strftime("%d.%m.%Y")
+    except ValueError:
+        await message.answer("Неверный формат даты. Используйте ДД.ММ.ГГГГ")
+        return
+    
     data = await state.get_data()
     subject = data["subject"]
     task = data["task"]
-    deadline = message.text
 
     cursor.execute(
         "INSERT INTO homework VALUES (NULL, ?, ?, ?, ?)",
-        (message.from_user.id, subject, task, deadline)
+        (message.from_user.id, subject, task, deadline_str)
     )
     conn.commit()
     await state.clear()
@@ -104,49 +110,146 @@ async def cmd_view_tasks(message: Message):
     if not rows:
         await message.answer("У вас нет активных заданий.")
     else:
-        tasks_list = "\n".join([f"{row[1]} - {row[2]}, Срок: {row[3]}" for row in rows])
+        tasks_list = ""
+        for row in rows:
+            tasks_list += f"{row[0]}. {row[2]} - {row[3]}, Срок: {row[4]}\n"
         await message.answer(f"Ваши текущие задания:\n{tasks_list}")
 
 # ✏️ Редактирование задания
 @dp.message(Command("edit_task"))
 async def cmd_edit_task(message: Message, state: FSMContext):
+    cursor.execute("SELECT * FROM homework WHERE user_id=?", (message.from_user.id,))
+    rows = cursor.fetchall()
+    
+    if not rows:
+        await message.answer("У вас нет заданий для редактирования.")
+        return
+    
     await state.set_state(EditTask.select_field)
+    
+    # Сохраняем список заданий в состоянии
+    tasks_dict = {}
+    keyboard = []
+    
+    for row in rows:
+        task_id = row[0]
+        task_text = f"{row[2]}: {row[3][:20]}..."
+        tasks_dict[str(task_id)] = task_text
+        keyboard.append([f"ID: {task_id} - {row[2]}"])
+    
+    await state.update_data(available_tasks=tasks_dict)
+    
+    keyboard.append(["Отмена"])
+    reply_markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, one_time_keyboard=True)
+    await message.answer("Выберите задание для редактирования (укажите ID):", reply_markup=reply_markup)
+
+@dp.message(F.text, EditTask.select_field)
+async def process_select_field(message: Message, state: FSMContext):
+    if message.text.lower() == "отмена":
+        await state.clear()
+        return await message.answer("Редактирование отменено.", reply_markup=ReplyKeyboardMarkup(remove_keyboard=True))
+    
+    # Извлекаем ID из сообщения
+    try:
+        if "ID:" in message.text:
+            task_id = int(message.text.split("ID:")[1].split("-")[0].strip())
+        else:
+            task_id = int(message.text)
+    except ValueError:
+        await message.answer("Пожалуйста, укажите корректный ID задания.")
+        return
+    
+    # Проверяем существование задания
+    cursor.execute("SELECT * FROM homework WHERE id=? AND user_id=?", (task_id, message.from_user.id))
+    task = cursor.fetchone()
+    
+    if not task:
+        await message.answer("Задание с таким ID не найдено.")
+        return
+    
+    await state.update_data(selected_task_id=task_id)
+    
+    # Показываем поля для редактирования
     keyboard = [
-        ["Название предмета"],
-        ["Описание задания"],
-        ["Срок сдачи"],
+        ["Предмет"],
+        ["Описание"],
+        ["Дедлайн"],
         ["Отмена"]
     ]
-    reply_markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-    await message.answer("Выберите поле для редактирования:", reply_markup=reply_markup)
-
-@dp.message(EditTask.select_field)
-async def process_select_field(message: Message, state: FSMContext):
-    field = message.text.lower().strip()
-    fields_map = {
-        "название предмета": "subject",
-        "описание задания": "task",
-        "срок сдачи": "deadline"
-    }
-    selected_field = fields_map.get(field)
-    if selected_field is None or field == "отмена":
-        await state.clear()
-        return await message.answer("Изменение отменено.", reply_markup=None)
+    reply_markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, one_time_keyboard=True)
+    await message.answer(f"Выберите поле для редактирования задания:\n"
+                        f"Предмет: {task[2]}\n"
+                        f"Описание: {task[3][:50]}...\n"
+                        f"Дедлайн: {task[4]}", 
+                        reply_markup=reply_markup)
     
-    await state.update_data(selected_field=selected_field)
+    # Переходим к выбору нового значения
     await state.set_state(EditTask.new_value)
-    await message.answer(f"Введите новое значение для поля '{field}':", reply_markup=None)
 
-@dp.message(EditTask.new_value)
+@dp.message(F.text, EditTask.new_value)
 async def process_new_value(message: Message, state: FSMContext):
-    new_value = message.text.strip()
-    data = await state.get_data()
-    selected_field = data['selected_field']
+    if message.text.lower() == "отмена":
+        await state.clear()
+        return await message.answer("Редактирование отменено.", reply_markup=ReplyKeyboardMarkup(remove_keyboard=True))
     
-    cursor.execute(f"UPDATE homework SET {selected_field}=? WHERE user_id=? AND id=(SELECT MAX(id) FROM homework WHERE user_id=?)", (new_value, message.from_user.id, message.from_user.id))
+    data = await state.get_data()
+    task_id = data['selected_task_id']
+    field = message.text.lower()
+    
+    field_mapping = {
+        "предмет": "subject",
+        "описание": "task",
+        "дедлайн": "deadline"
+    }
+    
+    if field not in field_mapping:
+        await message.answer("Пожалуйста, выберите одно из предложенных полей.")
+        return
+    
+    db_field = field_mapping[field]
+    
+    # Сохраняем выбранное поле в состоянии и запрашиваем новое значение
+    await state.update_data(field_to_edit=db_field)
+    
+    # Для дедлайна показываем пример формата
+    if field == "дедлайн":
+        await message.answer(f"Введите новое значение для {field} (формат: ДД.ММ.ГГГГ):", 
+                           reply_markup=ReplyKeyboardMarkup(remove_keyboard=True))
+    else:
+        await message.answer(f"Введите новое значение для {field}:", 
+                           reply_markup=ReplyKeyboardMarkup(remove_keyboard=True))
+    
+    # Остаемся в этом состоянии для получения нового значения
+    return
+
+@dp.message(F.text)
+async def process_field_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    field_to_edit = data.get('field_to_edit')
+    task_id = data.get('selected_task_id')
+    
+    if not field_to_edit or not task_id:
+        # Если нет данных о редактировании, игнорируем
+        return
+    
+    new_value = message.text
+    
+    # Валидация для дедлайна
+    if field_to_edit == "deadline":
+        try:
+            deadline_date = datetime.strptime(new_value, "%d.%m.%Y")
+            new_value = deadline_date.strftime("%d.%m.%Y")
+        except ValueError:
+            await message.answer("Неверный формат даты. Используйте ДД.ММ.ГГГГ")
+            return
+    
+    # Обновляем задание в базе данных
+    cursor.execute(f"UPDATE homework SET {field_to_edit}=? WHERE id=? AND user_id=?", 
+                   (new_value, task_id, message.from_user.id))
     conn.commit()
+    
     await state.clear()
-    await message.answer(f"Поле '{data['selected_field']}' успешно обновлено на '{new_value}'.")
+    await message.answer(f"Задание успешно обновлено!")
 
 # ❌ Удаление задания
 @dp.message(Command("delete_task"))
@@ -156,40 +259,65 @@ async def cmd_delete_task(message: Message):
     if not rows:
         await message.answer("У вас нет активных заданий.")
     else:
-        buttons = []
-        for i, row in enumerate(rows):
-            button_text = f"{i+1}. {row[2]} ({row[3]})"
-            buttons.append(button_text)
-        
         inline_kb = InlineKeyboardBuilder()
-        for btn in buttons:
-            inline_kb.add(InlineKeyboardButton(text=btn, callback_data=f"del_{rows[int(btn.split('.')[0])-1][0]}"))
-        inline_kb.adjust(2)
+        for row in rows:
+            button_text = f"{row[2]} ({row[4]})"
+            inline_kb.add(InlineKeyboardButton(text=button_text, callback_data=f"del_{row[0]}"))
+        inline_kb.adjust(1)
         
         await message.answer("Выберите задание для удаления:", reply_markup=inline_kb.as_markup())
 
-@dp.callback_query(Text(startswith="del_"))
+@dp.callback_query(F.data.startswith("del_"))
 async def delete_task_callback(callback: CallbackQuery):
     task_id = int(callback.data.split('_')[1])
+    
+    # Проверяем, принадлежит ли задание пользователю
+    cursor.execute("SELECT * FROM homework WHERE id=? AND user_id=?", 
+                   (task_id, callback.from_user.id))
+    task = cursor.fetchone()
+    
+    if not task:
+        await callback.answer("Задание не найдено!")
+        return
+    
     cursor.execute("DELETE FROM homework WHERE id=?", (task_id,))
     conn.commit()
-    await callback.message.edit_text("Задача удалена.")
+    
+    await callback.message.edit_text(f"Задание '{task[2]}' удалено.")
+    await callback.answer()
 
 # Функция для отправки уведомлений о дедлайнах
 async def send_deadline_reminders():
     while True:
+        await asyncio.sleep(1800)  # Проверка каждые 30 минут
+        
         now = datetime.now()
-        next_check_time = now.replace(minute=now.minute // 30 * 30, second=0, microsecond=0) + timedelta(minutes=30)
-        await asyncio.sleep((next_check_time - now).total_seconds())  # ждем следующего полувасного интервала
-        cursor.execute("SELECT * FROM homework WHERE DATETIME(deadline) >= DATETIME('now') AND DATETIME(deadline) <= DATETIME('now', '+3 hours')")
-        upcoming_rows = cursor.fetchall()
-        for row in upcoming_rows:
-            await bot.send_message(row[1], f"У вас скоро крайний срок сдачи задания '{row[2]}', срок: {row[3]}")
+        
+        # Ищем задания с дедлайном в ближайшие 3 часа
+        cursor.execute("SELECT * FROM homework WHERE deadline IS NOT NULL")
+        all_tasks = cursor.fetchall()
+        
+        for task in all_tasks:
+            try:
+                deadline = datetime.strptime(task[4], "%d.%m.%Y")
+                time_diff = deadline - now
+                
+                # Если дедлайн через 1-3 часа
+                if timedelta(hours=1) <= time_diff <= timedelta(hours=3):
+                    await bot.send_message(
+                        task[1], 
+                        f"⏰ Напоминание: задание '{task[2]}' нужно сдать через {int(time_diff.total_seconds()/3600)} час(а/ов).\n"
+                        f"Дедлайн: {task[4]}"
+                    )
+            except (ValueError, TypeError):
+                continue
 
 # Основной цикл
 async def main():
+    # Запускаем задачу напоминаний в фоне
+    asyncio.create_task(send_deadline_reminders())
+    
     await dp.start_polling(bot)
-    await send_deadline_reminders()
 
 if __name__ == "__main__":
     asyncio.run(main())
