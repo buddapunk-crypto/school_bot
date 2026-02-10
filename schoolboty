@@ -314,10 +314,12 @@ async def send_deadline_reminders():
 
 # Основной цикл
 async def main():
+    # Удаляем вебхук перед запуском polling
+    await bot.delete_webhook(drop_pending_updates=True)
+    
     # Запускаем задачу напоминаний в фоне
     asyncio.create_task(send_deadline_reminders())
     
     await dp.start_polling(bot)
-
 if __name__ == "__main__":
     asyncio.run(main())
