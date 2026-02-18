@@ -7,13 +7,47 @@ import sqlite3
 from datetime import datetime
 import time
 import re
+import logging
+from logging.handlers import RotatingFileHandler
+from collections import defaultdict
+import hashlib
+from functools import lru_cache
 
-# ============ ВСТАВЬТЕ СВОИ ТОКЕНЫ ============
+# ============ ТОКЕНЫ (ВСТАВЬТЕ СВОИ) ============
 TELEGRAM_TOKEN = "8343120896:AAEBFxXWTtHBr7cVe6e6fSLAADkjlibCF9A"  # ВАШ ТОКЕН
-DEEPSEEK_API_KEY = "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"      # ВАШ КЛЮЧ
+DEEPSEEK_API_KEY = "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"  # ВАШ КЛЮЧ
+ADMIN_ID = 1491724422  # ВАШ TELEGRAM ID ДЛЯ УВЕДОМЛЕНИЙ
 # ==============================================
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+
+# Настройка логирования
+def setup_logging():
+    logger = logging.getLogger('bot_logger')
+    logger.setLevel(logging.INFO)
+    
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    file_handler = RotatingFileHandler(
+        'bot.log', 
+        maxBytes=10485760,
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(formatter)
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+logger = setup_logging()
 
 # Функция для удаления вебхука
 def delete_webhook():
@@ -22,11 +56,9 @@ def delete_webhook():
         resp = requests.post(url, params={"drop_pending_updates": True}, timeout=10)
         if resp.status_code != 200:
             raise ValueError(f"Не удалось удалить вебхук: {resp.text}")
-        print("✅ Вебхук удалён успешно.")
+        logger.info("✅ Вебхук удалён успешно.")
     except Exception as e:
-        print(f"Ошибка при удалении вебхука: {e}")
-
-
+        logger.error(f"Ошибка при удалении вебхука: {e}")
 
 # Подключение к Телеграмму
 delete_webhook()
@@ -36,14 +68,18 @@ time.sleep(1)
 # Подключение к базе данных SQLite
 conn = sqlite3.connect('test_bot.db', check_same_thread=False)
 c = conn.cursor()
+
+# Создание таблиц
 c.execute('''
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
         first_name TEXT,
-        registered_date TEXT
+        registered_date TEXT,
+        language TEXT DEFAULT 'ru'
     )'''
 )
+
 c.execute('''
     CREATE TABLE IF NOT EXISTS results (
         user_id INTEGER,
@@ -52,36 +88,184 @@ c.execute('''
         timestamp TEXT
     )'''
 )
+
 c.execute('''
     CREATE TABLE IF NOT EXISTS stats (
         user_id INTEGER PRIMARY KEY,
         total INTEGER DEFAULT 0,
         correct INTEGER DEFAULT 0,
-        streak INTEGER DEFAULT 0
+        streak INTEGER DEFAULT 0,
+        last_active TEXT,
+        favorite_topic TEXT,
+        average_time REAL DEFAULT 0,
+        total_time_spent INTEGER DEFAULT 0
     )'''
 )
+
+c.execute('''
+    CREATE TABLE IF NOT EXISTS topic_progress (
+        user_id INTEGER,
+        topic TEXT,
+        total_attempts INTEGER DEFAULT 0,
+        correct_answers INTEGER DEFAULT 0,
+        last_attempt TEXT,
+        PRIMARY KEY (user_id, topic)
+    )'''
+)
+
+c.execute('''
+    CREATE TABLE IF NOT EXISTS feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        feedback TEXT,
+        timestamp TEXT
+    )'''
+)
+
 conn.commit()
 
 # Сессии пользователей
 user_sessions = {}
+user_last_message = defaultdict(float)
+RATE_LIMIT = 1  # секунд между сообщениями
 
-# Функция вызова DeepSeek
-def ask_deepseek(prompt):
-    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+# Многоязычность
+translations = {
+    'ru': {
+        'welcome': "👋 Привет, {name}!\nЯ бот для тестирования по информатике.",
+        'correct': "✅ Правильно!",
+        'wrong': "❌ Неправильно.\nПравильный ответ: {correct}\n\n{explanation}",
+        'stats': "📊 Статистика:\n✅ Всего: {total}\n✓ Верно: {correct}\n📈 Точность: {accuracy}%\n🔥 Серия: {streak}",
+        'no_stats': "Пока нет статистики. Пройди тест!",
+        'choose_topic': "Выбери тему:",
+        'what_explain': "Что объяснить?",
+        'generating': "🔄 Генерирую...",
+        'test_complete': "✅ Тест завершён!",
+        'rate_limit': "⏳ Пожалуйста, подождите {time} сек...",
+        'error': "😔 Произошла ошибка. Попробуйте позже.",
+        'feedback_prompt': "📝 Напишите ваш отзыв или предложение по улучшению бота:\n(или отправьте /cancel для отмены)",
+        'feedback_cancel': "❌ Отзыв отменён",
+        'feedback_thanks': "✅ Спасибо за ваш отзыв! Мы обязательно его рассмотрим.",
+        'reset_confirm': "⚠️ Вы уверены, что хотите сбросить всю статистику?",
+        'reset_success': "✅ Статистика успешно сброшена!",
+        'reset_cancel': "❌ Сброс отменён",
+        'help_text': """
+🤖 **Доступные команды:**
+
+/start - Начать работу с ботом
+/help - Показать эту справку
+/stats - Моя статистика
+/topics - Список доступных тем
+/reset - Сбросить мою статистику
+/feedback - Отправить отзыв
+
+📱 **Кнопки меню:**
+• 📝 Тест - Пройти тестирование
+• 📚 Темы - Изучить теорию
+• 📊 Статистика - Мои результаты
+• ❓ Объясни - Получить объяснение
+• 🎲 Случайный - Случайный вопрос
+
+❓ **Как отвечать:**
+Просто напиши номер ответа (1-4)
+"""
+    }
+}
+
+def get_text(user_id, key, **kwargs):
+    """Получение текста на языке пользователя"""
+    c.execute("SELECT language FROM users WHERE user_id=?", (user_id,))
+    result = c.fetchone()
+    lang = result[0] if result else 'ru'
+    
+    text = translations.get(lang, translations['ru']).get(key, key)
+    return text.format(**kwargs) if kwargs else text
+
+# Декоратор для безопасного вызова функций
+def safe_bot_call(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Ошибка в {func.__name__}: {e}", exc_info=True)
+            try:
+                message = args[0] if args else None
+                if message and hasattr(message, 'chat'):
+                    bot.send_message(message.chat.id, get_text(message.from_user.id, 'error'))
+            except:
+                pass
+    return wrapper
+
+# Функция вызова DeepSeek с повторными попытками
+def ask_deepseek(prompt, retries=3):
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}", 
+        "Content-Type": "application/json"
+    }
     payload = {
         "model": "deepseek-reasoner",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.7
     }
-    try:
-        resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=20)
-        if resp.status_code != 200:
-            raise ValueError(f"Ошибка запроса к API: {resp.text}")
-        data = resp.json()
-        return data["choices"][0]["message"]["content"] if data.get("choices") else None
-    except Exception as e:
-        print(f"Ошибка вызова DeepSeek API: {e}")
-        return None
+    
+    for attempt in range(retries):
+        try:
+            resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=20)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"] if data.get("choices") else None
+            elif resp.status_code == 429:
+                wait_time = 2 ** attempt
+                logger.warning(f"Превышен лимит запросов. Ожидание {wait_time} сек...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Ошибка API: {resp.status_code} - {resp.text}")
+                
+        except requests.exceptions.Timeout:
+            logger.warning(f"Таймаут запроса (попытка {attempt + 1})")
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"Ошибка соединения (попытка {attempt + 1})")
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка: {e}")
+            
+        if attempt < retries - 1:
+            time.sleep(1)
+    
+    return None
+
+# Валидация вопроса
+def validate_question(question):
+    required_fields = ['question', 'options', 'correct_answer', 'explanation']
+    
+    if not all(field in question for field in required_fields):
+        missing = [field for field in required_fields if field not in question]
+        logger.warning(f"Отсутствуют поля: {missing}")
+        return False
+    
+    if not isinstance(question['options'], list):
+        logger.warning("options не является списком")
+        return False
+    
+    if len(question['options']) != 4:
+        logger.warning(f"Неверное количество опций: {len(question['options'])}")
+        return False
+    
+    if question['correct_answer'] not in question['options']:
+        logger.warning("Правильный ответ не найден в опциях")
+        return False
+    
+    return True
+
+# Кэширование вопросов
+@lru_cache(maxsize=100)
+def get_cached_question(topic_hash):
+    return generate_question_base(topic_hash)
+
+def generate_question_base(topic_hash):
+    """Базовая генерация вопроса без кэширования"""
+    return generate_question(topic_hash if topic_hash != "random" else None)
 
 # Генерация вопроса
 def generate_question(topic=None):
@@ -90,18 +274,22 @@ def generate_question(topic=None):
         topic = random.choice(topics)
     
     prompt = f"""Создай тестовый вопрос по {topic}. 
-Формат JSON: {{"question":"...","options":["1","2","3","4"],"correct":"...","explanation":"..."}}"""
+Формат JSON: {{"question":"...","options":["1","2","3","4"],"correct_answer":"...","explanation":"..."}}"""
     
     response = ask_deepseek(prompt)
     if response:
         try:
-            json_match = re.search(r'\{(.*?)\}', response, re.DOTALL)
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 question = json.loads(json_match.group())
-                question['topic'] = topic
-                return question
+                if validate_question(question):
+                    question['topic'] = topic
+                    return question
+                else:
+                    logger.warning(f"Сгенерирован некорректный вопрос: {question}")
         except Exception as e:
-            print(f"Ошибка парсинга JSON: {e}")
+            logger.error(f"Ошибка парсинга JSON: {e}")
+            logger.debug(f"Ответ API: {response[:200]}...")
     
     # Резервный вопрос
     return {
@@ -114,54 +302,95 @@ def generate_question(topic=None):
 
 # Старт
 @bot.message_handler(commands=['start'])
+@safe_bot_call
 def start(message):
+    user_id = message.from_user.id
     name = message.from_user.first_name or "Ученик"
     
     # Регистрация нового пользователя
-    c.execute("INSERT OR IGNORE INTO users VALUES (?,?,?,?)", 
-              (message.from_user.id, message.from_user.username, name, datetime.now().isoformat()))
-    c.execute("INSERT OR IGNORE INTO stats VALUES (?,0,0,0)", (message.from_user.id,))
+    c.execute("""INSERT OR IGNORE INTO users (user_id, username, first_name, registered_date, language) 
+                  VALUES (?,?,?,?,?)""", 
+              (user_id, message.from_user.username, name, datetime.now().isoformat(), 'ru'))
+    c.execute("INSERT OR IGNORE INTO stats (user_id) VALUES (?)", (user_id,))
     conn.commit()
     
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add('📝 Тест', '📚 Темы', '📊 Статистика', '❓ Объясни', '🎲 Случайный')
     
-    bot.send_message(message.chat.id, f"👋 Привет, {name}!\nЯ бот для тестирования по информатике.", reply_markup=markup)
+    bot.send_message(message.chat.id, get_text(user_id, 'welcome', name=name), reply_markup=markup)
+
+# Команда help
+@bot.message_handler(commands=['help'])
+@safe_bot_call
+def help_command(message):
+    bot.send_message(message.chat.id, get_text(message.from_user.id, 'help_text'), parse_mode='Markdown')
+
+# Команда stats
+@bot.message_handler(commands=['stats'])
+@safe_bot_call
+def stats_command(message):
+    show_statistics(message)
+
+# Команда topics
+@bot.message_handler(commands=['topics'])
+@safe_bot_call
+def topics_command(message):
+    show_topics_menu(message)
+
+# Команда reset
+@bot.message_handler(commands=['reset'])
+@safe_bot_call
+def reset_command(message):
+    user_id = message.from_user.id
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("✅ Да, сбросить", callback_data="confirm_reset"),
+        types.InlineKeyboardButton("❌ Нет", callback_data="cancel_reset")
+    )
+    bot.send_message(user_id, get_text(user_id, 'reset_confirm'), reply_markup=markup)
+
+# Команда feedback
+@bot.message_handler(commands=['feedback'])
+@safe_bot_call
+def feedback_command(message):
+    user_id = message.from_user.id
+    msg = bot.send_message(user_id, get_text(user_id, 'feedback_prompt'))
+    
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {}
+    user_sessions[user_id]['waiting_feedback'] = True
 
 # Обработчик нажатий кнопок
 @bot.message_handler(func=lambda m: True)
+@safe_bot_call
 def handle_button_click(message):
     user_id = message.from_user.id
     text = message.text
     
-    if text == '📝 Тест':
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            types.InlineKeyboardButton('Системы счисления', callback_data='topic_ss'),
-            types.InlineKeyboardButton('Python', callback_data='topic_py'),
-            types.InlineKeyboardButton('Алгоритмы', callback_data='topic_algo'),
-            types.InlineKeyboardButton('Сети', callback_data='topic_net'),
-            types.InlineKeyboardButton('Случайная', callback_data='topic_rand')
-        )
-        bot.send_message(user_id, "Выбери тему:", reply_markup=markup)
+    # Проверка частоты сообщений
+    current_time = time.time()
+    time_since_last = current_time - user_last_message[user_id]
     
-    elif text == '📚 Темы':
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            types.InlineKeyboardButton('Системы счисления', callback_data='explain_ss'),
-            types.InlineKeyboardButton('Python', callback_data='explain_py'),
-            types.InlineKeyboardButton('Алгоритмы', callback_data='explain_algo')
-        )
-        bot.send_message(user_id, "Что объяснить?", reply_markup=markup)
+    if time_since_last < RATE_LIMIT:
+        bot.send_message(user_id, get_text(user_id, 'rate_limit', 
+                         time=round(RATE_LIMIT - time_since_last, 1)))
+        return
+    
+    user_last_message[user_id] = current_time
+    
+    # Проверка ожидания отзыва
+    if user_id in user_sessions and user_sessions[user_id].get('waiting_feedback'):
+        handle_feedback(message)
+        return
+    
+    if text == '📝 Тест':
+        show_topics_menu(message)
+    
+    elif text == '📚 Темы' or text == '❓ Объясни':
+        show_explain_menu(message)
     
     elif text == '📊 Статистика':
-        c.execute("SELECT total, correct, streak FROM stats WHERE user_id=?", (user_id,))
-        result = c.fetchone()
-        if result and result[0] > 0:
-            accuracy = round(result[1] / result[0] * 100, 1)
-            bot.send_message(user_id, f"📊 Статистика:\n✅ Всего: {result[0]}\n✓ Верно: {result[1]}\n📈 Точность: {accuracy}%\n🔥 Серия: {result[2]}")
-        else:
-            bot.send_message(user_id, "Пока нет статистики. Пройди тест!")
+        show_statistics(message)
     
     elif text == '🎲 Случайный':
         send_question(user_id, None)
@@ -169,10 +398,72 @@ def handle_button_click(message):
     elif user_id in user_sessions and user_sessions[user_id].get('waiting'):
         check_answer(message)
 
+def show_topics_menu(message):
+    """Показать меню выбора темы для теста"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    topics = [
+        ('Системы счисления', 'topic_ss'),
+        ('Python', 'topic_py'),
+        ('Алгоритмы', 'topic_algo'),
+        ('Сети', 'topic_net'),
+        ('Базы данных', 'topic_db'),
+        ('Случайная', 'topic_rand')
+    ]
+    
+    buttons = []
+    for topic_name, callback_data in topics:
+        buttons.append(types.InlineKeyboardButton(topic_name, callback_data=callback_data))
+    markup.add(*buttons)
+    
+    bot.send_message(message.chat.id, get_text(message.from_user.id, 'choose_topic'), reply_markup=markup)
+
+def show_explain_menu(message):
+    """Показать меню выбора темы для объяснения"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    topics = [
+        ('Системы счисления', 'explain_ss'),
+        ('Python', 'explain_py'),
+        ('Алгоритмы', 'explain_algo'),
+        ('Сети', 'explain_net'),
+        ('Базы данных', 'explain_db'),
+        ('ООП', 'explain_oop')
+    ]
+    
+    buttons = []
+    for topic_name, callback_data in topics:
+        buttons.append(types.InlineKeyboardButton(topic_name, callback_data=callback_data))
+    markup.add(*buttons)
+    
+    bot.send_message(message.chat.id, get_text(message.from_user.id, 'what_explain'), reply_markup=markup)
+
+def show_statistics(message):
+    """Показать статистику пользователя"""
+    user_id = message.from_user.id
+    c.execute("SELECT total, correct, streak FROM stats WHERE user_id=?", (user_id,))
+    result = c.fetchone()
+    
+    if result and result[0] > 0:
+        accuracy = round(result[1] / result[0] * 100, 1)
+        bot.send_message(user_id, get_text(user_id, 'stats', 
+                         total=result[0], correct=result[1], 
+                         accuracy=accuracy, streak=result[2]))
+    else:
+        bot.send_message(user_id, get_text(user_id, 'no_stats'))
+
 # Отправка вопроса пользователю
 def send_question(user_id, topic):
-    question = generate_question(topic)
-    user_sessions[user_id] = {'q': question, 'waiting': True}
+    # Создаем хеш темы для кэширования
+    topic_hash = hashlib.md5(topic.encode()).hexdigest() if topic else "random"
+    
+    # Пытаемся получить вопрос из кэша
+    question = get_cached_question(topic_hash)
+    
+    # Если вопрос невалидный, генерируем новый
+    if not validate_question(question):
+        get_cached_question.cache_clear()
+        question = generate_question(topic)
+    
+    user_sessions[user_id] = {'q': question, 'waiting': True, 'start_time': time.time()}
     
     options = '\n'.join([f'{i + 1}. {option}' for i, option in enumerate(question['options'])])
     msg = f"📚 {question['topic']}\n\n❓ {question['question']}\n\n{options}\n\n✏️ Напиши номер ответа (1-4)"
@@ -192,6 +483,9 @@ def check_answer(message):
     question = session['q']
     user_answer_idx = message.text.strip()
     
+    # Обновляем время ответа
+    answer_time = time.time() - session.get('start_time', time.time())
+    
     if user_answer_idx.isdigit() and 1 <= int(user_answer_idx) <= len(question['options']):
         user_answer = question['options'][int(user_answer_idx) - 1]
     else:
@@ -200,13 +494,29 @@ def check_answer(message):
     correct_answer = question['correct_answer']
     is_correct = user_answer.lower() == correct_answer.lower()
     
-    # Обновляем статистику пользователя
+    # Обновляем статистику
     c.execute("""
         UPDATE stats 
         SET total = total + 1, 
             correct = correct + ?, 
-            streak = CASE WHEN ?=1 THEN streak+1 ELSE 0 END 
-        WHERE user_id=?""", (1 if is_correct else 0, 1 if is_correct else 0, user_id))
+            streak = CASE WHEN ?=1 THEN streak+1 ELSE 0 END,
+            last_active = ?,
+            average_time = (average_time * (total) + ?) / (total + 1)
+        WHERE user_id=?""", 
+        (1 if is_correct else 0, 1 if is_correct else 0, 
+         datetime.now().isoformat(), answer_time, user_id))
+    
+    # Обновляем прогресс по теме
+    c.execute("""
+        INSERT INTO topic_progress (user_id, topic, total_attempts, correct_answers, last_attempt)
+        VALUES (?, ?, 1, ?, ?)
+        ON CONFLICT(user_id, topic) DO UPDATE SET
+            total_attempts = total_attempts + 1,
+            correct_answers = correct_answers + ?,
+            last_attempt = ?
+        """, (user_id, question['topic'], 1 if is_correct else 0, 
+              datetime.now().isoformat(), 1 if is_correct else 0, datetime.now().isoformat()))
+    
     conn.commit()
     
     if is_correct:
@@ -215,46 +525,97 @@ def check_answer(message):
         feedback = f"❌ Неправильно.\nПравильный ответ: {correct_answer}.\n\n{question.get('explanation', 'Повтори тему.')}"
     
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton('➡️ Далее', callback_data='next'), types.InlineKeyboardButton('❌ Стоп', callback_data='stop'))
+    markup.add(
+        types.InlineKeyboardButton('➡️ Далее', callback_data='next'),
+        types.InlineKeyboardButton('❌ Стоп', callback_data='stop')
+    )
     
     bot.send_message(user_id, feedback, reply_markup=markup)
     user_sessions[user_id]['waiting'] = False
 
-# Callback-обработчик нажатий inline-кнопок
+# Обработчик отзывов
+def handle_feedback(message):
+    user_id = message.from_user.id
+    
+    if message.text == '/cancel':
+        user_sessions[user_id]['waiting_feedback'] = False
+        bot.send_message(user_id, get_text(user_id, 'feedback_cancel'))
+        return
+    
+    c.execute("INSERT INTO feedback (user_id, feedback, timestamp) VALUES (?, ?, ?)",
+              (user_id, message.text, datetime.now().isoformat()))
+    conn.commit()
+    
+    user_sessions[user_id]['waiting_feedback'] = False
+    bot.send_message(user_id, get_text(user_id, 'feedback_thanks'))
+    
+    # Отправляем уведомление администратору
+    if ADMIN_ID:
+        try:
+            bot.send_message(ADMIN_ID, 
+                f"📬 Новый отзыв от @{message.from_user.username} (ID: {user_id}):\n\n{message.text}")
+        except:
+            pass
+
+# Callback-обработчик
 @bot.callback_query_handler(func=lambda call: True)
+@safe_bot_call
 def process_callback(call):
     user_id = call.from_user.id
     
-    if call.data.startswith('topic_'):
+    # Обработка сброса статистики
+    if call.data == 'confirm_reset':
+        c.execute("UPDATE stats SET total=0, correct=0, streak=0 WHERE user_id=?", (user_id,))
+        c.execute("DELETE FROM topic_progress WHERE user_id=?", (user_id,))
+        conn.commit()
+        bot.edit_message_text(get_text(user_id, 'reset_success'), 
+                             call.message.chat.id, call.message.message_id)
+    
+    elif call.data == 'cancel_reset':
+        bot.edit_message_text(get_text(user_id, 'reset_cancel'), 
+                             call.message.chat.id, call.message.message_id)
+    
+    # Обработка выбора темы для теста
+    elif call.data.startswith('topic_'):
         topics_map = {
             'topic_ss': 'Системы счисления',
             'topic_py': 'Python',
             'topic_algo': 'Алгоритмы',
             'topic_net': 'Сети',
+            'topic_db': 'Базы данных',
             'topic_rand': None
         }
         topic = topics_map.get(call.data)
-        bot.edit_message_text("🔄 Генерирую...", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        bot.edit_message_text(get_text(user_id, 'generating'), 
+                            chat_id=call.message.chat.id, 
+                            message_id=call.message.message_id)
         send_question(user_id, topic)
     
+    # Обработка выбора темы для объяснения
     elif call.data.startswith('explain_'):
         topics_map = {
             'explain_ss': 'Системы счисления',
             'explain_py': 'Python',
-            'explain_algo': 'Алгоритмы'
+            'explain_algo': 'Алгоритмы',
+            'explain_net': 'Сети',
+            'explain_db': 'Базы данных',
+            'explain_oop': 'ООП'
         }
         topic = topics_map.get(call.data)
-        bot.edit_message_text(f"📖 Объясняю {topic}...", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        bot.edit_message_text(f"📖 Объясняю {topic}...", 
+                            chat_id=call.message.chat.id, 
+                            message_id=call.message.message_id)
         
         explanation = ask_deepseek(f"Объясни {topic} простыми словами, с примерами")
         if explanation:
             bot.send_message(user_id, f"📚 {topic}\n\n{explanation}")
         else:
-            bot.send_message(user_id, "😔 Ошибка, попробуй позже")
+            bot.send_message(user_id, get_text(user_id, 'error'))
     
+    # Обработка навигации по тесту
     elif call.data == 'next':
         if user_id in user_sessions:
-            prev_topic = user_sessions[user_id].get('q').get('topic')
+            prev_topic = user_sessions[user_id].get('q', {}).get('topic')
             send_question(user_id, prev_topic)
     
     elif call.data == 'stop':
@@ -262,11 +623,17 @@ def process_callback(call):
             del user_sessions[user_id]
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
         markup.add('📝 Тест', '📚 Темы', '📊 Статистика', '❓ Объясни', '🎲 Случайный')
-        bot.send_message(user_id, "✅ Тест завершён!", reply_markup=markup)
+        bot.send_message(user_id, get_text(user_id, 'test_complete'), reply_markup=markup)
     
     bot.answer_callback_query(call.id)
 
-# Запуск бесконечного цикла опроса
+# Запуск бота
 if __name__ == "__main__":
-    print("🤖 Бот запущен...")
-    bot.infinity_polling()
+    logger.info("🚀 Бот запущен...")
+    try:
+        bot.infinity_polling()
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+    finally:
+        conn.close()
+        logger.info("📁 Соединение с БД закрыто")
