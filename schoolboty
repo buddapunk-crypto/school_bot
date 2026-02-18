@@ -16,7 +16,7 @@ from functools import lru_cache
 # ============ ТОКЕНЫ (ВСТАВЬТЕ СВОИ) ============
 TELEGRAM_TOKEN = "8343120896:AAEBFxXWTtHBr7cVe6e6fSLAADkjlibCF9A"  # ВАШ ТОКЕН
 DEEPSEEK_API_KEY = "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"  # ВАШ КЛЮЧ
-ADMIN_ID = 1491724422  # ВАШ TELEGRAM ID ДЛЯ УВЕДОМЛЕНИЙ
+ADMIN_ID = 1491724422  # ВАШ TELEGRAM ID
 # ==============================================
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
@@ -24,7 +24,7 @@ DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 # Настройка логирования
 def setup_logging():
     logger = logging.getLogger('bot_logger')
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)  # Изменено на DEBUG для отладки
     
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -139,7 +139,7 @@ translations = {
         'no_stats': "Пока нет статистики. Пройди тест!",
         'choose_topic': "Выбери тему:",
         'what_explain': "Что объяснить?",
-        'generating': "🔄 Генерирую...",
+        'generating': "🔄 Генерирую вопрос...",
         'test_complete': "✅ Тест завершён!",
         'rate_limit': "⏳ Пожалуйста, подождите {time} сек...",
         'error': "😔 Произошла ошибка. Попробуйте позже.",
@@ -202,19 +202,40 @@ def ask_deepseek(prompt, retries=3):
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}", 
         "Content-Type": "application/json"
     }
+    
+    # Более конкретный промпт для получения JSON
+    enhanced_prompt = f"""Ты - помощник для создания учебных тестов. Сгенерируй вопрос по указанной теме.
+    
+{prompt}
+
+ВАЖНО: Ответ должен быть ТОЛЬКО в формате JSON, без дополнительного текста. 
+Пример формата:
+{{
+    "question": "Текст вопроса",
+    "options": ["Вариант 1", "Вариант 2", "Вариант 3", "Вариант 4"],
+    "correct_answer": "Вариант 1",
+    "explanation": "Объяснение правильного ответа"
+}}"""
+    
     payload = {
         "model": "deepseek-reasoner",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7
+        "messages": [{"role": "user", "content": enhanced_prompt}],
+        "temperature": 0.7,
+        "max_tokens": 500
     }
     
     for attempt in range(retries):
         try:
-            resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=20)
+            logger.debug(f"Отправка запроса к API (попытка {attempt + 1})")
+            resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=30)
+            
+            logger.debug(f"Статус ответа: {resp.status_code}")
             
             if resp.status_code == 200:
                 data = resp.json()
-                return data["choices"][0]["message"]["content"] if data.get("choices") else None
+                content = data["choices"][0]["message"]["content"]
+                logger.debug(f"Получен ответ от API: {content[:200]}...")
+                return content
             elif resp.status_code == 429:
                 wait_time = 2 ** attempt
                 logger.warning(f"Превышен лимит запросов. Ожидание {wait_time} сек...")
@@ -231,7 +252,7 @@ def ask_deepseek(prompt, retries=3):
             logger.error(f"Неизвестная ошибка: {e}")
             
         if attempt < retries - 1:
-            time.sleep(1)
+            time.sleep(2)
     
     return None
 
@@ -253,19 +274,10 @@ def validate_question(question):
         return False
     
     if question['correct_answer'] not in question['options']:
-        logger.warning("Правильный ответ не найден в опциях")
+        logger.warning(f"Правильный ответ '{question['correct_answer']}' не найден в опциях")
         return False
     
     return True
-
-# Кэширование вопросов
-@lru_cache(maxsize=100)
-def get_cached_question(topic_hash):
-    return generate_question_base(topic_hash)
-
-def generate_question_base(topic_hash):
-    """Базовая генерация вопроса без кэширования"""
-    return generate_question(topic_hash if topic_hash != "random" else None)
 
 # Генерация вопроса
 def generate_question(topic=None):
@@ -273,32 +285,96 @@ def generate_question(topic=None):
     if not topic:
         topic = random.choice(topics)
     
-    prompt = f"""Создай тестовый вопрос по {topic}. 
-Формат JSON: {{"question":"...","options":["1","2","3","4"],"correct_answer":"...","explanation":"..."}}"""
+    logger.info(f"Генерация вопроса по теме: {topic}")
+    
+    # База данных резервных вопросов
+    backup_questions = {
+        "Системы счисления": {
+            "question": "Какая система счисления используется в компьютерах?",
+            "options": ["Двоичная", "Десятичная", "Восьмеричная", "Шестнадцатеричная"],
+            "correct_answer": "Двоичная",
+            "explanation": "Компьютеры используют двоичную систему счисления (0 и 1), так как это легко реализовать электронно.",
+            "topic": "Системы счисления"
+        },
+        "Python": {
+            "question": "Какой оператор используется для проверки условия в Python?",
+            "options": ["if", "for", "while", "switch"],
+            "correct_answer": "if",
+            "explanation": "Оператор if используется для условного выполнения кода в Python.",
+            "topic": "Python"
+        },
+        "Алгоритмы": {
+            "question": "Какой алгоритм сортировки имеет сложность O(n log n) в среднем случае?",
+            "options": ["Быстрая сортировка", "Пузырьковая сортировка", "Сортировка вставками", "Сортировка выбором"],
+            "correct_answer": "Быстрая сортировка",
+            "explanation": "Быстрая сортировка имеет среднюю сложность O(n log n), в то время как пузырьковая - O(n²).",
+            "topic": "Алгоритмы"
+        },
+        "Сети": {
+            "question": "Какой протокол используется для передачи веб-страниц?",
+            "options": ["HTTP", "FTP", "SMTP", "POP3"],
+            "correct_answer": "HTTP",
+            "explanation": "HTTP (HyperText Transfer Protocol) используется для передачи веб-страниц.",
+            "topic": "Сети"
+        },
+        "Базы данных": {
+            "question": "Какой язык используется для работы с реляционными базами данных?",
+            "options": ["SQL", "Python", "Java", "HTML"],
+            "correct_answer": "SQL",
+            "explanation": "SQL (Structured Query Language) - язык структурированных запросов для работы с БД.",
+            "topic": "Базы данных"
+        }
+    }
+    
+    prompt = f"""Создай тестовый вопрос по теме "{topic}".
+    
+Требования к вопросу:
+1. Вопрос должен быть по информатике/программированию
+2. 4 варианта ответа
+3. Один правильный ответ
+4. Краткое объяснение правильного ответа
+
+Ответ предоставь ТОЛЬКО в формате JSON:
+{{
+    "question": "текст вопроса",
+    "options": ["вариант 1", "вариант 2", "вариант 3", "вариант 4"],
+    "correct_answer": "правильный вариант",
+    "explanation": "объяснение"
+}}"""
     
     response = ask_deepseek(prompt)
+    
     if response:
         try:
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            # Ищем JSON в ответе
+            json_match = re.search(r'\{[^{}]*\{[^{}]*\}[^{}]*\}|\{[^{}]*\}', response, re.DOTALL)
             if json_match:
-                question = json.loads(json_match.group())
+                json_str = json_match.group()
+                logger.debug(f"Найден JSON: {json_str}")
+                
+                # Очищаем JSON от возможных проблем
+                json_str = re.sub(r',\s*}', '}', json_str)  # Удаляем лишние запятые перед }
+                json_str = re.sub(r',\s*]', ']', json_str)  # Удаляем лишние запятые перед ]
+                
+                question = json.loads(json_str)
+                
                 if validate_question(question):
                     question['topic'] = topic
+                    logger.info(f"Успешно сгенерирован вопрос: {question['question'][:50]}...")
                     return question
                 else:
-                    logger.warning(f"Сгенерирован некорректный вопрос: {question}")
-        except Exception as e:
+                    logger.warning(f"Сгенерирован некорректный вопрос, используем резервный")
+            else:
+                logger.warning("JSON не найден в ответе API")
+                logger.debug(f"Полный ответ: {response}")
+        except json.JSONDecodeError as e:
             logger.error(f"Ошибка парсинга JSON: {e}")
-            logger.debug(f"Ответ API: {response[:200]}...")
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка при парсинге: {e}")
     
-    # Резервный вопрос
-    return {
-        "question": "Что такое алгоритм?",
-        "options": ["Набор команд", "Устройство", "Программа", "Язык"],
-        "correct_answer": "Набор команд",
-        "explanation": "Алгоритм - это последовательность команд",
-        "topic": topic
-    }
+    # Возвращаем резервный вопрос
+    logger.info(f"Использую резервный вопрос по теме {topic}")
+    return backup_questions.get(topic, backup_questions["Python"])
 
 # Старт
 @bot.message_handler(commands=['start'])
@@ -354,7 +430,7 @@ def reset_command(message):
 @safe_bot_call
 def feedback_command(message):
     user_id = message.from_user.id
-    msg = bot.send_message(user_id, get_text(user_id, 'feedback_prompt'))
+    bot.send_message(user_id, get_text(user_id, 'feedback_prompt'))
     
     if user_id not in user_sessions:
         user_sessions[user_id] = {}
@@ -386,7 +462,10 @@ def handle_button_click(message):
     if text == '📝 Тест':
         show_topics_menu(message)
     
-    elif text == '📚 Темы' or text == '❓ Объясни':
+    elif text == '📚 Темы':
+        show_explain_menu(message)
+    
+    elif text == '❓ Объясни':
         show_explain_menu(message)
     
     elif text == '📊 Статистика':
@@ -452,16 +531,9 @@ def show_statistics(message):
 
 # Отправка вопроса пользователю
 def send_question(user_id, topic):
-    # Создаем хеш темы для кэширования
-    topic_hash = hashlib.md5(topic.encode()).hexdigest() if topic else "random"
+    logger.info(f"Отправка вопроса пользователю {user_id}, тема: {topic}")
     
-    # Пытаемся получить вопрос из кэша
-    question = get_cached_question(topic_hash)
-    
-    # Если вопрос невалидный, генерируем новый
-    if not validate_question(question):
-        get_cached_question.cache_clear()
-        question = generate_question(topic)
+    question = generate_question(topic)
     
     user_sessions[user_id] = {'q': question, 'waiting': True, 'start_time': time.time()}
     
@@ -606,8 +678,10 @@ def process_callback(call):
                             chat_id=call.message.chat.id, 
                             message_id=call.message.message_id)
         
-        explanation = ask_deepseek(f"Объясни {topic} простыми словами, с примерами")
+        explanation = ask_deepseek(f"Объясни {topic} простыми словами, с примерами. Ответ дай на русском языке.")
         if explanation:
+            # Очищаем ответ от возможных JSON
+            explanation = re.sub(r'\{.*\}', '', explanation, flags=re.DOTALL)
             bot.send_message(user_id, f"📚 {topic}\n\n{explanation}")
         else:
             bot.send_message(user_id, get_text(user_id, 'error'))
