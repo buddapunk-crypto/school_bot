@@ -14,7 +14,7 @@ import hashlib
 from functools import lru_cache
 
 # ============ ТОКЕНЫ (ВСТАВЬТЕ СВОИ) ============
-TELEGRAM_TOKEN = "8343120896:AAEBFxXWTtHBr7cVe6e6fSLAADkjlibCF9A"  # ВАШ ТОКЕН
+TELEGRAM_TOKEN = "8302751664:AAGUmyVg5lUOUkVPbfkBAQcnSs3jGjWuQG0"  # ВАШ ТОКЕН
 DEEPSEEK_API_KEY = "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"  # ВАШ КЛЮЧ
 ADMIN_ID = 1491724422  # ВАШ TELEGRAM ID
 # ==============================================
